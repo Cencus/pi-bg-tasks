@@ -1,0 +1,18 @@
+{
+  "name": "@cencus/pi-bg-tasks",
+  "version": "1.0.0",
+  "description": "Pi extension: run long shell commands in the background instead of blocking the agent. Adds bg_run + bg_status tools and a /bg command, with completion notifications.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/bg-tasks.ts"],
+    "skills": ["./skills/bg-tasks"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
