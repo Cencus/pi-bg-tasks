@@ -22,6 +22,15 @@ a desktop/terminal notification when the command exits.
 The task table is in-memory for the lifetime of the Pi process. Logs persist on
 disk, so you can read them even after a restart.
 
+## What it is *not* for
+
+`bg_run` exists so the agent can **do other work** while a command runs — not so
+it can keep blocking on `sleep`. Following `bg_run` with `sleep 20 && tail ...`
+or a sleep-poll loop re-blocks the session and is strictly worse than a plain
+foreground call. The correct pattern is: start the task, do something useful,
+then check `bg_status` once — or end the turn and let the completion
+notification wake the session.
+
 ## Install
 
 From npm (once published):
