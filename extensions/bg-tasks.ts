@@ -158,12 +158,14 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 	let wakeTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function queueWake(task: BgTask) {
+		if (dead) return;
 		finishedQueue.push(task);
 		if (wakeTimer) return;
 		wakeTimer = setTimeout(() => {
 			wakeTimer = null;
 			const batch = finishedQueue.splice(0, finishedQueue.length);
 			if (batch.length === 0) return;
+			if (dead) return;
 			const body = batch
 				.map((t) => {
 					const out = tailLog(t, 15);
@@ -240,13 +242,37 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 		return n;
 	}
 
-	function refreshStatusLine(ctx: ExtensionContext) {
-		const n = runningCount();
-		if (n > 0) {
-			ctx.ui.setStatus("bg-tasks", ctx.ui.theme.fg("accent", `bg:${n} running`));
-		} else {
-			ctx.ui.setStatus("bg-tasks", "");
+	// The freshest session ctx we've been handed. Session-bound ctx objects go
+	// stale after newSession / fork / switchSession / reload, and child-process
+	// callbacks (plus their timers) can fire long after that. So never keep a
+	// ctx around to use later: re-read this slot at call time, and treat every
+	// ui touch as best-effort — a stale ctx throws on property access, and that
+	// throw escaping an async callback kills pi with an uncaughtException.
+	let uiCtx: ExtensionContext | null = null;
+	let dead = false;
+
+	function adoptCtx(ctx: ExtensionContext | null | undefined) {
+		if (ctx) uiCtx = ctx;
+	}
+
+	function withUi(touch: (ui: ExtensionContext["ui"]) => void) {
+		const ctx = uiCtx;
+		if (dead || !ctx) return;
+		try {
+			touch(ctx.ui);
+		} catch {
+			// Session was replaced: drop the stale ctx until session_start re-adopts.
+			uiCtx = null;
 		}
+	}
+
+	function notify(message: string, level: "info" | "error") {
+		withUi((ui) => ui.notify(message, level));
+	}
+
+	function refreshStatusLine() {
+		const n = runningCount();
+		withUi((ui) => ui.setStatus("bg-tasks", n > 0 ? ui.theme.fg("accent", `bg:${n} running`) : ""));
 	}
 
 	function tailLog(task: BgTask, lines: number): string {
@@ -280,6 +306,7 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 		parameters: BgRunParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			adoptCtx(ctx);
 			const cwd = params.cwd || ctx.cwd;
 			const id = newId();
 			const logPath = join(LOG_DIR, `${id}.log`);
@@ -332,12 +359,8 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 				task.exitCode = -1;
 				task.finishedAt = Date.now();
 				closeLog(() => {
-					try {
-						ctx.ui.notify(`bg ${id} failed: ${err.message}`, "error");
-					} catch {
-						/* ui gone */
-					}
-					refreshStatusLine(ctx);
+					notify(`bg ${id} failed: ${err.message}`, "error");
+					refreshStatusLine();
 					resolveWaiters(task);
 					queueWake(task);
 				});
@@ -354,18 +377,14 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 					const ok = task.status === "done";
 					const dur = ((task.finishedAt - task.startedAt) / 1000).toFixed(1);
 					const msg = `${id} ${ok ? "done" : "failed"} (${dur}s, exit ${code})`;
-					try {
-						ctx.ui.notify(msg, ok ? "info" : "error");
-					} catch {
-						/* ui gone */
-					}
-					refreshStatusLine(ctx);
+					notify(msg, ok ? "info" : "error");
+					refreshStatusLine();
 					resolveWaiters(task);
 					queueWake(task);
 				});
 			});
 
-			refreshStatusLine(ctx);
+			refreshStatusLine();
 
 			const head = summarize(task);
 			return {
@@ -508,11 +527,22 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 	// Keep log dir tidy is the user's job; we only ensure it exists on load.
 	pi.on("session_start", async (_event, ctx) => {
 		mkdirSync(LOG_DIR, { recursive: true });
-		refreshStatusLine(ctx);
+		dead = false;
+		adoptCtx(ctx);
+		refreshStatusLine();
 	});
 
 	// On shutdown, leave children running (truly background). We only flush a note.
 	pi.on("session_shutdown", async () => {
+		// This instance's session is gone; stop touching ui / injecting messages.
+		// Children keep running on purpose, their logs still land on disk.
+		dead = true;
+		uiCtx = null;
+		if (wakeTimer) {
+			clearTimeout(wakeTimer);
+			wakeTimer = null;
+		}
+		finishedQueue.length = 0;
 		const running = Array.from(tasks.values()).filter((t) => t.status === "running");
 		if (running.length > 0) {
 			for (const t of running) {
