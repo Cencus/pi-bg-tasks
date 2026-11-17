@@ -2,10 +2,18 @@
  * Background Tasks Extension for Pi
  *
  * Adds two tools the model can call:
- *   - bg_run   : start a shell command in the background, return immediately,
- *                and notify via ctx.ui.notify() when it finishes.
- *   - bg_status: report status of background tasks (running / done / failed)
- *                and optionally tail the log.
+ *   - bg_run   : start a shell command in the background and return immediately.
+ *                On exit it injects a custom message into the session with
+ *                triggerTurn, so the *model* is woken (not just the human via
+ *                ctx.ui.notify) and can continue on its own.
+ *   - bg_status: report status of background tasks (running / done / failed),
+ *                optionally tail the log, and optionally block until the task
+ *                finishes (waitMs).
+ *
+ * Completions used to only call ctx.ui.notify(), which shows a toast to the
+ * human but injects nothing into the model's context. So "end the turn, the
+ * completion notification will wake you" was false, and models compensated by
+ * calling `sleep`. Every completion now also lands as a custom_message entry.
  *
  * Plus a `/bg` command for the user to see the task list in the TUI.
  *
@@ -45,10 +53,22 @@ const BgRunParams = Type.Object({
 
 const BgStatusParams = Type.Object({
 	id: Type.Optional(Type.String({ description: "Inspect a single task by id. Omit to list all." })),
+	waitMs: Type.Optional(
+		Type.Number({
+			description:
+				"With id: block until the task finishes, up to this many ms (max 120000). " +
+				"Returns as soon as it exits. Use this instead of shell sleep.",
+		}),
+	),
 	tail: Type.Optional(
 		Type.Number({ description: "Number of trailing log lines to include (default 20). 0 = none." }),
 	),
 });
+
+// Delay used to merge tasks that finish together into a single wake message.
+const WAKE_COALESCE_MS = 1500;
+const WAIT_MAX_MS = 120_000;
+
 
 const LOG_DIR = join(homedir(), ".pi", "bg-tasks");
 
@@ -58,6 +78,82 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 	// In-memory task registry. Keyed by task id.
 	const tasks = new Map<string, BgTask>();
 	let counter = 0;
+
+	// Resolvers waiting inside bg_status(waitMs), keyed by task id.
+	const waiters = new Map<string, Array<() => void>>();
+
+	function resolveWaiters(task: BgTask) {
+		const list = waiters.get(task.id);
+		if (!list) return;
+		waiters.delete(task.id);
+		for (const resolve of list) resolve();
+	}
+
+	// Resolves true when the task leaves "running", false on timeout or abort.
+	function waitForExit(task: BgTask, ms: number, signal?: AbortSignal): Promise<boolean> {
+		if (task.status !== "running") return Promise.resolve(true);
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			const finish = (value: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				resolve(value);
+			};
+			const onAbort = () => finish(false);
+			const timer = setTimeout(() => finish(false), ms);
+			const list = waiters.get(task.id) ?? [];
+			list.push(() => finish(true));
+			waiters.set(task.id, list);
+			signal?.addEventListener("abort", onAbort, { once: true });
+		});
+	}
+
+	// A completion wakes the model through the session, not only the human.
+	// One message per burst: tasks finishing together cost one turn, not one each.
+	const finishedQueue: BgTask[] = [];
+	let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function queueWake(task: BgTask) {
+		finishedQueue.push(task);
+		if (wakeTimer) return;
+		wakeTimer = setTimeout(() => {
+			wakeTimer = null;
+			const batch = finishedQueue.splice(0, finishedQueue.length);
+			if (batch.length === 0) return;
+			const body = batch
+				.map((t) => {
+					const out = tailLog(t, 15);
+					return out ? `${summarize(t)}\n--- last 15 lines ---\n${out}` : summarize(t);
+				})
+				.join("\n\n");
+			try {
+				pi.sendMessage(
+					{
+						customType: "bg-task-done",
+						content:
+							`Background task${batch.length > 1 ? "s" : ""} finished (${batch.length}):\n\n${body}\n\n` +
+							"Read more with bg_status if needed. Do not sleep to wait for background tasks.",
+						display: true,
+						details: {
+							tasks: batch.map((t) => ({
+								id: t.id,
+								status: t.status,
+								exitCode: t.exitCode,
+								command: t.command,
+								logPath: t.logPath,
+							})),
+						},
+					},
+					{ deliverAs: "steer", triggerTurn: true },
+				);
+			} catch {
+				/* session gone — the toast already told the human */
+			}
+		}, WAKE_COALESCE_MS);
+		wakeTimer.unref?.();
+	}
 
 	function newId(): string {
 		counter += 1;
@@ -150,6 +246,8 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 						/* ui gone */
 					}
 					refreshStatusLine(ctx);
+					resolveWaiters(task);
+					queueWake(task);
 				});
 			});
 
@@ -168,6 +266,8 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 						/* ui gone */
 					}
 					refreshStatusLine(ctx);
+					resolveWaiters(task);
+					queueWake(task);
 				});
 			});
 
@@ -178,8 +278,10 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `${head}\nlog: ${logPath}\nThe command is running detached from the agent. ` +
-							`It will notify on completion. Use bg_status to check progress.`,
+						text: `${head}\nlog: ${logPath}\nThe command is running detached from the agent. Its ` +
+							"completion is injected into this session as a message, so you do not need to stay " +
+							"on it: end the turn and you will be resumed when it finishes. To block on it " +
+							"instead, call bg_status with waitMs. Never follow bg_run with sleep.",
 					},
 				],
 				details: { id, logPath, pid: task.pid, status: "running" },
@@ -209,13 +311,15 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bg_status",
 		label: "BgStatus",
-		description:
+			description:
 			"Report status of background tasks started with bg_run. " +
 			"Without an id, lists every task (id, status, exit code, duration, command). " +
-			"With an id, returns the same plus the last N lines of its log (tail, default 20).",
+			"With an id, returns the same plus the last N lines of its log (tail, default 20). " +
+			"Pass waitMs (up to 120000) to block until that task finishes or the deadline hits: " +
+			"this is the supported way to wait for a bg task, not a shell sleep.",
 		parameters: BgStatusParams,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			const tail = params.tail ?? 20;
 
 			if (params.id) {
@@ -226,10 +330,19 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 						details: { id: params.id, found: false },
 					};
 				}
+				const waitMs = Math.min(Math.max(params.waitMs ?? 0, 0), WAIT_MAX_MS);
+				let waitNote = "";
+				if (t.status === "running" && waitMs > 0) {
+					const finished = await waitForExit(t, waitMs, signal as AbortSignal | undefined);
+					waitNote = finished
+						? "(finished while waiting)\n"
+						: `(still running after waiting ${waitMs}ms — do not sleep; end the turn and the ` +
+							"completion message will resume you)\n";
+				}
 				const lines = tailLog(t, tail);
 				const body =
 					`${summarize(t)}\nlog: ${t.logPath}\n` +
-					(t.status === "running" ? "(still running)\n" : "") +
+					(t.status === "running" ? waitNote || "(still running)\n" : waitNote) +
 					(lines ? `\n--- last ${tail} lines ---\n${lines}\n` : "");
 				return {
 					content: [{ type: "text", text: body }],

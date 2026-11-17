@@ -29,11 +29,16 @@ those through `bg_run` just adds overhead.
 
 1. Call `bg_run` with `command` (and optional `cwd`). It returns immediately
    with a task `id` and a `log` path under `~/.pi/bg-tasks/`.
-2. The command keeps running detached. A notification fires when it exits.
+2. The command keeps running detached. When it exits, a completion message is
+   injected into the session with `triggerTurn`, so the turn resumes on its own
+   (the user also gets a toast). You do not need to stay on it.
 3. To check progress, call `bg_status`:
    - No args → list every task and its status.
    - `id` → status of one task, plus the last lines of its log (`tail`,
      default 20).
+   - `id` + `waitMs` → block until that task exits or the deadline hits (max
+     120000). Returns the moment it finishes. **This is the supported way to
+     wait for a bg task.**
 4. Before reporting "done" to the user, confirm with `bg_status` that the task
    actually finished (status `done` / `failed`) and include the exit code and
    any relevant tail output.
@@ -51,8 +56,11 @@ runs. It is not a licence to keep blocking with `sleep`:
   (read code, write the next unrelated change) or just report to the user that
   it is running and what you will do next.
 - Reaching for `sleep` next to `bg_run` is a signal you had nothing else to do:
-  that is fine — say so and end the turn. The completion notification will
-  wake the session.
+  that is fine — say so and end the turn. Completion injects a message that
+  resumes you, so the work continues without you blocking.
+- If you genuinely need the result before doing anything else, call
+  `bg_status { id, waitMs }` — one call, wakes on exit, no fixed delay. That is
+  the legitimate await; `sleep` never is.
 - `sleep` inside a `bg_run` command itself is also pointless unless the command
   genuinely needs a delay.
 
@@ -60,6 +68,8 @@ runs. It is not a licence to keep blocking with `sleep`:
 
 - The task table is in-memory and lives for the Pi process. Logs persist on
   disk, so you can read them even after a restart.
+- Completions that land within ~1.5s of each other are merged into a single
+  `bg-task-done` message, so parallel tasks cost one turn, not one each.
 - If a background task fails, read the tail, diagnose, and either fix and
   re-run with `bg_run` or fall back to a foreground `bash` call for debugging.
 - Don't start a second `bg_run` for the same job while the first is still
