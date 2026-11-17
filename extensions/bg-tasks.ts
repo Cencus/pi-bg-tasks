@@ -29,7 +29,7 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -49,6 +49,13 @@ interface BgTask {
 const BgRunParams = Type.Object({
 	command: Type.String({ description: "Shell command to run in the background." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
+	shell: Type.Optional(
+		Type.String({
+			description:
+				"Shell executable to run the command with. Defaults to the shell the bash tool uses " +
+				"(settings.shellPath, else Git Bash on Windows, else sh/bash). Pass pwsh.exe for PowerShell.",
+		}),
+	),
 });
 
 const BgStatusParams = Type.Object({
@@ -68,6 +75,41 @@ const BgStatusParams = Type.Object({
 // Delay used to merge tasks that finish together into a single wake message.
 const WAKE_COALESCE_MS = 1500;
 const WAIT_MAX_MS = 120_000;
+
+interface ShellPick {
+	shell: string;
+	args: string[];
+	/** cmd.exe needs the whole command as one literal string, not argv. */
+	legacyString: boolean;
+}
+
+function isFile(path: string): boolean {
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function whichSync(cmd: string): string | undefined {
+	for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+		if (!dir) continue;
+		const full = join(dir, cmd);
+		if (isFile(full)) return full;
+	}
+	return undefined;
+}
+
+function shellArgsFor(shell: string): ShellPick {
+	const lower = shell.toLowerCase();
+	if (lower.endsWith("pwsh.exe") || lower.endsWith("powershell.exe")) {
+		return { shell, args: ["-NoProfile", "-NonInteractive", "-Command"], legacyString: false };
+	}
+	if (lower.endsWith("cmd.exe")) {
+		return { shell, args: [], legacyString: true };
+	}
+	return { shell, args: ["-c"], legacyString: false };
+}
 
 
 const LOG_DIR = join(homedir(), ".pi", "bg-tasks");
@@ -161,6 +203,37 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 		return `bg-${counter}-${stamp}`;
 	}
 
+	// bg_run used `shell: true`, which is cmd.exe on Windows — so `sleep`, `&&`
+	// chains and anything else the model writes in bash syntax failed with a
+	// localized "not recognized as a command" error. Use the same shell the bash
+	// tool resolves (settings.shellPath, then Git Bash, then sh/bash).
+	function resolveShell(override?: string): ShellPick {
+		if (override) return shellArgsFor(override);
+		let configured: string | undefined;
+		try {
+			const raw = (pi as unknown as { getSettings?: () => { shellPath?: string } }).getSettings?.();
+			configured = raw?.shellPath;
+		} catch {
+			/* older pi without getSettings */
+		}
+		if (configured) {
+			const expanded = configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured;
+			if (isFile(expanded)) return shellArgsFor(expanded);
+		}
+		if (process.platform === "win32") {
+			const gitBash = [
+				join(process.env.ProgramFiles ?? "", "Git", "bin", "bash.exe"),
+				join(process.env["ProgramFiles(x86)"] ?? "", "Git", "bin", "bash.exe"),
+			].find(isFile);
+			if (gitBash) return shellArgsFor(gitBash);
+			const onPath = whichSync("bash.exe");
+			if (onPath) return shellArgsFor(onPath);
+			return { shell: process.env.ComSpec || "cmd.exe", args: [], legacyString: true };
+		}
+		const posix = ["/bin/bash", "/usr/bin/bash", "/bin/sh"].find(isFile);
+		return shellArgsFor(posix ?? process.env.SHELL ?? "sh");
+	}
+
 	function runningCount(): number {
 		let n = 0;
 		for (const t of tasks.values()) if (t.status === "running") n += 1;
@@ -200,22 +273,24 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 		description:
 			"Run a shell command in the background and return immediately. " +
 			"Output is tee'd to a log file under ~/.pi/bg-tasks/. " +
-			"A desktop/terminal notification fires when the command exits. " +
+			"Runs via the bash tool's shell (settings.shellPath, else Git Bash) — write bash syntax. " +
 			"Use this for long-running installs, builds, downloads, or servers " +
 			"instead of the blocking bash tool. Returns the task id and log path. " +
-			"Poll completion with bg_status.",
+			"Completion is injected as a message; to wait, call bg_status with waitMs — never sleep.",
 		parameters: BgRunParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = params.cwd || ctx.cwd;
 			const id = newId();
 			const logPath = join(LOG_DIR, `${id}.log`);
+			const pick = resolveShell(params.shell);
 
-			const child = spawn(params.command, {
-				shell: true,
-				cwd,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const child = pick.legacyString
+				? spawn(params.command, { shell: pick.shell, cwd, stdio: ["ignore", "pipe", "pipe"] })
+				: spawn(pick.shell, [...pick.args, params.command], {
+						cwd,
+						stdio: ["ignore", "pipe", "pipe"],
+					});
 
 			const task: BgTask = {
 				id,
@@ -229,17 +304,34 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 			tasks.set(id, task);
 
 			const log = createWriteStream(logPath, { flags: "w" });
-			log.write(`$ ${params.command}\n# cwd: ${cwd}\n# pid: ${child.pid}\n\n`);
+			// When spawn fails (bad shell path) both "error" and "close" fire, and the
+			// pipes can outlive end(). A broken log must never crash pi.
+			log.on("error", () => {});
+			let logClosed = false;
+			const closeLog = (after: () => void) => {
+				if (logClosed) return;
+				logClosed = true;
+				log.end(after);
+			};
+			const writeLog = (chunk: string | Buffer) => {
+				if (logClosed) return;
+				try {
+					log.write(chunk);
+				} catch {
+					/* stream died */
+				}
+			};
+			writeLog(`$ ${params.command}\n# cwd: ${cwd}\n# shell: ${pick.shell}\n# pid: ${child.pid}\n\n`);
 
-			child.stdout.on("data", (chunk: Buffer) => log.write(chunk));
-			child.stderr.on("data", (chunk: Buffer) => log.write(chunk));
+			child.stdout.on("data", writeLog);
+			child.stderr.on("data", writeLog);
 
 			child.on("error", (err) => {
-				log.write(`\n# error: ${err.message}\n`);
+				writeLog(`\n# error: ${err.message}\n`);
 				task.status = "failed";
 				task.exitCode = -1;
 				task.finishedAt = Date.now();
-				log.end(() => {
+				closeLog(() => {
 					try {
 						ctx.ui.notify(`bg ${id} failed: ${err.message}`, "error");
 					} catch {
@@ -252,11 +344,13 @@ export default function bgTasksExtension(pi: ExtensionAPI) {
 			});
 
 			child.on("close", (code) => {
+				// A spawn error already finalized the task; don't overwrite or double-wake.
+				if (task.finishedAt) return;
 				task.finishedAt = Date.now();
 				task.exitCode = code ?? -1;
 				task.status = code === 0 ? "done" : "failed";
-				log.write(`\n# exit ${code}\n`);
-				log.end(() => {
+				writeLog(`\n# exit ${code}\n`);
+				closeLog(() => {
 					const ok = task.status === "done";
 					const dur = ((task.finishedAt - task.startedAt) / 1000).toFixed(1);
 					const msg = `${id} ${ok ? "done" : "failed"} (${dur}s, exit ${code})`;

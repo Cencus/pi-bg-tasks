@@ -28,7 +28,10 @@ those through `bg_run` just adds overhead.
 ## How to use it
 
 1. Call `bg_run` with `command` (and optional `cwd`). It returns immediately
-   with a task `id` and a `log` path under `~/.pi/bg-tasks/`.
+   with a task `id` and a `log` path under `~/.pi/bg-tasks/`. The command runs
+   through the same shell as the `bash` tool (`settings.shellPath`, else Git
+   Bash on Windows), so **write bash syntax** — `&&`, `sleep`, `$VAR`. Pass
+   `shell` to override, for example `shell: "pwsh.exe"`.
 2. The command keeps running detached. When it exits, a completion message is
    injected into the session with `triggerTurn`, so the turn resumes on its own
    (the user also gets a toast). You do not need to stay on it.
