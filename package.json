@@ -1,11 +1,18 @@
 {
   "name": "@cencus/pi-bg-tasks",
-  "version": "1.1.1",
-  "description": "Pi extension: run long shell commands in the background instead of blocking the agent. Adds bg_run + bg_status tools (with waitMs) and a /bg command; completion messages wake the model.",
+  "version": "1.2.0",
+  "description": "Pi extension: run long shell commands detached from the agent instead of blocking it. Adds bg_run, bg_status, bg_kill (with waitMs and timeoutMs) and a /bg command; completion wakes the model.",
+  "type": "module",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
+  "scripts": {
+    "test": "node --test \"tests/*.test.ts\"",
+    "smoke": "node tests/smoke.mjs",
+    "detach-check": "node tests/detach-check.mjs",
+    "test:all": "npm test && npm run smoke && npm run detach-check"
+  },
   "pi": {
     "extensions": [
       "./extensions/bg-tasks.ts"
